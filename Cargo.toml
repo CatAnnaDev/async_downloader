@@ -7,6 +7,10 @@ license = "Unlicense"
 repository = "https://github.com/CatAnnaDev/async_downloader"
 keywords = ["async", "download", "egui", "iced", "tokio"]
 categories = ["asynchronous", "gui"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "async_downloader"
