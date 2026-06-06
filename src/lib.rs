@@ -207,6 +207,126 @@ impl Download {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BatchProgress {
+    pub files: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub bytes_received: u64,
+    pub bytes_total: Option<u64>,
+    pub speed: f64,
+}
+
+impl BatchProgress {
+    pub fn settled(&self) -> usize {
+        self.done + self.failed + self.cancelled
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.files > 0 && self.settled() == self.files
+    }
+
+    pub fn all_done(&self) -> bool {
+        self.files > 0 && self.done == self.files
+    }
+
+    pub fn fraction(&self) -> Option<f32> {
+        match self.bytes_total {
+            Some(total) if total > 0 => Some((self.bytes_received as f32 / total as f32).min(1.0)),
+            _ if self.files > 0 => Some(self.settled() as f32 / self.files as f32),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Batch {
+    downloads: Vec<Download>,
+}
+
+impl Batch {
+    pub fn new(downloads: Vec<Download>) -> Self {
+        Self { downloads }
+    }
+
+    pub fn downloads(&self) -> &[Download] {
+        &self.downloads
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.progress().is_complete()
+    }
+
+    pub fn pause_all(&self) {
+        self.downloads.iter().for_each(Download::pause);
+    }
+
+    pub fn resume_all(&self) {
+        self.downloads.iter().for_each(Download::resume);
+    }
+
+    pub fn cancel_all(&self) {
+        self.downloads.iter().for_each(Download::cancel);
+    }
+
+    pub fn progress(&self) -> BatchProgress {
+        let mut acc = BatchProgress {
+            files: self.downloads.len(),
+            done: 0,
+            failed: 0,
+            cancelled: 0,
+            bytes_received: 0,
+            bytes_total: Some(0),
+            speed: 0.0,
+        };
+
+        for download in &self.downloads {
+            match download.progress() {
+                Progress::Done(outcome) => {
+                    acc.done += 1;
+                    acc.bytes_received += outcome.bytes;
+                    if let Some(total) = acc.bytes_total.as_mut() {
+                        *total += outcome.bytes;
+                    }
+                }
+                Progress::Failed(_) => {
+                    acc.failed += 1;
+                    acc.bytes_total = None;
+                }
+                Progress::Cancelled => acc.cancelled += 1,
+                Progress::Downloading {
+                    received,
+                    total,
+                    speed,
+                } => {
+                    acc.bytes_received += received;
+                    acc.speed += speed;
+                    accumulate_total(&mut acc.bytes_total, total);
+                }
+                Progress::Paused { received, total } => {
+                    acc.bytes_received += received;
+                    accumulate_total(&mut acc.bytes_total, total);
+                }
+                Progress::Queued | Progress::Verifying => acc.bytes_total = None,
+            }
+        }
+
+        acc
+    }
+}
+
+fn accumulate_total(acc: &mut Option<u64>, total: Option<u64>) {
+    match total {
+        Some(total) => {
+            if let Some(sum) = acc.as_mut() {
+                *sum += total;
+            }
+        }
+        None => *acc = None,
+    }
+}
+
 pub struct Downloader {
     rt: tokio::runtime::Runtime,
     queue: async_channel::Sender<Arc<Shared>>,
@@ -276,6 +396,10 @@ impl Downloader {
             state: state_rx,
             queue: self.queue.clone(),
         }
+    }
+
+    pub fn enqueue_batch(&self, jobs: impl IntoIterator<Item = Job>) -> Batch {
+        Batch::new(jobs.into_iter().map(|job| self.enqueue(job)).collect())
     }
 }
 

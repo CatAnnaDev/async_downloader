@@ -19,6 +19,9 @@ and `iced` behind feature flags.
 - SHA-256 verification: the finished file is re-read from disk and hashed,
   optionally compared against an expected digest.
 - Live download speed, computed once in the engine and exposed to every UI.
+- Batch downloads: enqueue a whole pack of files as one unit and read aggregate
+  progress (files done, total bytes, combined speed) plus group controls. A
+  single archive is just one job; a launcher-style set of files is one batch.
 
 ## Async model
 
@@ -69,6 +72,34 @@ match download.progress() {
     _ => {}
 }
 ```
+
+## Batch / pack
+
+```rust
+use async_downloader::Job;
+
+let batch = downloader.enqueue_batch(vec![
+    Job::new("https://example.com/a.pak", "/data/a.pak").with_sha256("..."),
+    Job::new("https://example.com/b.pak", "/data/b.pak").with_sha256("..."),
+    Job::new("https://example.com/c.zip", "/data/c.zip"),
+]);
+
+let p = batch.progress(); // files, done, failed, bytes_received, bytes_total, speed
+let _ = p.fraction();     // overall 0.0..=1.0
+let _ = p.all_done();     // every file downloaded and verified
+
+batch.pause_all();
+batch.resume_all();
+batch.cancel_all();
+
+for download in batch.downloads() {
+    // per-file progress / controls
+}
+```
+
+Files already present and matching their expected SHA-256 are not re-downloaded:
+the engine issues one request, the server replies that the range is already
+satisfied, the local file is verified, and it goes straight to done.
 
 ## egui
 

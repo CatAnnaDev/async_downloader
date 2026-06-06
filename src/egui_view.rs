@@ -1,10 +1,55 @@
 use egui::{Color32, ProgressBar, Ui};
 
-use crate::{Download, Progress, Verification, file_name_from_url, human_bytes, human_speed};
+use crate::{
+    Batch, Download, Progress, Verification, file_name_from_url, human_bytes, human_speed,
+};
 
 pub fn repaint_notifier(ctx: &egui::Context) -> impl Fn() + Send + Sync + 'static {
     let ctx = ctx.clone();
     move || ctx.request_repaint()
+}
+
+pub fn batch_card(ui: &mut Ui, batch: &Batch) {
+    let progress = batch.progress();
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.strong(format!("Pack — {}/{} files", progress.done, progress.files));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Cancel all").clicked() {
+                    batch.cancel_all();
+                }
+                if ui.button("Resume all").clicked() {
+                    batch.resume_all();
+                }
+                if ui.button("Pause all").clicked() {
+                    batch.pause_all();
+                }
+            });
+        });
+
+        let bar = match progress.fraction() {
+            Some(fraction) => {
+                let label = match progress.bytes_total {
+                    Some(total) => format!(
+                        "{} / {}",
+                        human_bytes(progress.bytes_received),
+                        human_bytes(total)
+                    ),
+                    None => format!("{}/{} files", progress.settled(), progress.files),
+                };
+                ProgressBar::new(fraction).text(label)
+            }
+            None => ProgressBar::new(0.0).animate(true),
+        };
+        ui.add(bar);
+
+        ui.horizontal(|ui| {
+            ui.label(human_speed(progress.speed));
+            if progress.failed > 0 {
+                ui.colored_label(Color32::RED, format!("{} failed", progress.failed));
+            }
+        });
+    });
 }
 
 pub fn download_card(ui: &mut Ui, download: &Download) {

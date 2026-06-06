@@ -1,7 +1,9 @@
 use iced::widget::{button, column, progress_bar, row, scrollable, text, text_input};
 use iced::{Element, Subscription, Task};
 
-use async_downloader::{Download, Downloader, Job, Progress, Settings, Threads, Verification, iced_view};
+use async_downloader::{
+    Batch, Download, Downloader, Job, Progress, Settings, Threads, Verification, iced_view,
+};
 
 fn main() -> iced::Result {
     iced::application(State::new, State::update, State::view)
@@ -96,10 +98,26 @@ impl State {
             self.downloader.max_concurrent()
         ));
 
+        let pack = Batch::new(self.downloads.clone()).progress();
+        let overall = text(format!(
+            "Pack — {}/{} files · {} · {}",
+            pack.done,
+            pack.files,
+            pack.bytes_total
+                .map(|total| format!(
+                    "{} / {}",
+                    async_downloader::human_bytes(pack.bytes_received),
+                    async_downloader::human_bytes(total)
+                ))
+                .unwrap_or_else(|| format!("{}/{} settled", pack.settled(), pack.files)),
+            async_downloader::human_speed(pack.speed)
+        ));
+
         column![
             text("Async downloader").size(24),
             runtime,
             header,
+            overall,
             scrollable(column(cards).spacing(8)),
         ]
         .spacing(12)
