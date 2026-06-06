@@ -112,4 +112,5 @@ cargo run --example iced_app --features iced
 
 ## License
 
-MIT OR Apache-2.0.
+Released into the public domain under the Unlicense. Do whatever you want with it.
+See `LICENSE`.
