@@ -2,6 +2,7 @@
 name = "async_downloader"
 version = "0.1.0"
 edition = "2024"
+authors = ["CatAnnaDev"]
 description = "Async file downloader: prespawned worker pool, queue with concurrency limit, pause/resume, HTTP range resume, SHA-256 verification, with optional egui and iced integrations."
 license = "Unlicense"
 repository = "https://github.com/CatAnnaDev/async_downloader"
