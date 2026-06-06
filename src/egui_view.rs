@@ -1,14 +1,39 @@
+//! Ready-made `egui` widgets and helpers (enabled by the `egui` feature).
+
 use egui::{Color32, ProgressBar, Ui};
 
 use crate::{
     Batch, Download, Progress, Verification, file_name_from_url, human_bytes, human_speed,
 };
 
+/// Builds an [`Downloader::on_change`](crate::Downloader::on_change) callback
+/// that repaints the egui context whenever progress changes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use async_downloader::{Downloader, Settings, egui_view};
+/// # let ctx = egui::Context::default();
+/// let downloader = Downloader::new(Settings::default())
+///     .unwrap()
+///     .on_change(egui_view::repaint_notifier(&ctx));
+/// ```
 pub fn repaint_notifier(ctx: &egui::Context) -> impl Fn() + Send + Sync + 'static {
     let ctx = ctx.clone();
     move || ctx.request_repaint()
 }
 
+/// Draws an aggregate card for a [`Batch`]: overall bar, combined speed, file
+/// counts, and pause/resume/cancel-all buttons.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use async_downloader::{Batch, egui_view};
+/// # fn ui(ui: &mut egui::Ui, batch: &Batch) {
+/// egui_view::batch_card(ui, batch);
+/// # }
+/// ```
 pub fn batch_card(ui: &mut Ui, batch: &Batch) {
     let progress = batch.progress();
     ui.group(|ui| {
@@ -52,6 +77,17 @@ pub fn batch_card(ui: &mut Ui, batch: &Batch) {
     });
 }
 
+/// Draws a card for one [`Download`]: title, progress bar, speed, and the
+/// relevant control buttons for its current state.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use async_downloader::{Download, egui_view};
+/// # fn ui(ui: &mut egui::Ui, download: &Download) {
+/// egui_view::download_card(ui, download);
+/// # }
+/// ```
 pub fn download_card(ui: &mut Ui, download: &Download) {
     let progress = download.progress();
     ui.group(|ui| {

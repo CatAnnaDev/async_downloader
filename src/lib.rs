@@ -1,3 +1,38 @@
+//! Async file downloader for Rust GUIs.
+//!
+//! The engine runs on its own multi-threaded Tokio runtime and never blocks the
+//! UI thread: the interface only reads [`Download::progress`] and sends control
+//! commands ([`Download::pause`], [`Download::resume`], [`Download::cancel`]).
+//!
+//! A prespawned worker pool pulls [`Job`]s from a queue, so the number of
+//! workers is the number of simultaneous downloads. Each transfer streams to
+//! disk, can resume after an interruption via an HTTP `Range` request, and is
+//! verified with SHA-256 once finished.
+//!
+//! Optional ready-made UI integrations live behind the `egui` and `iced`
+//! features ([`egui_view`] / [`iced_view`]).
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use async_downloader::{Downloader, Job, Progress, Settings, Threads};
+//!
+//! let downloader = Downloader::new(Settings {
+//!     threads: Threads::Auto,
+//!     max_concurrent: 3,
+//! })
+//! .expect("runtime");
+//!
+//! let download = downloader.enqueue(Job::new(
+//!     "https://example.com/file.bin",
+//!     "/tmp/file.bin",
+//! ));
+//!
+//! if let Progress::Downloading { received, total, speed } = download.progress() {
+//!     println!("{received} / {total:?} at {speed} B/s");
+//! }
+//! ```
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,9 +49,15 @@ pub mod egui_view;
 #[cfg(feature = "iced")]
 pub mod iced_view;
 
+/// How many worker threads the internal Tokio runtime should use.
+///
+/// This is independent from [`Settings::max_concurrent`]: it sizes the runtime
+/// thread pool, not the number of simultaneous downloads.
 #[derive(Clone, Copy, Debug)]
 pub enum Threads {
+    /// Use [`std::thread::available_parallelism`] (falls back to 4).
     Auto,
+    /// Use exactly this many threads (clamped to at least 1).
     Fixed(usize),
 }
 
@@ -31,9 +72,21 @@ impl Threads {
     }
 }
 
+/// Configuration for a [`Downloader`].
+///
+/// # Examples
+///
+/// ```
+/// use async_downloader::{Settings, Threads};
+///
+/// let settings = Settings { threads: Threads::Fixed(8), max_concurrent: 4 };
+/// assert_eq!(Settings::default().max_concurrent, 3);
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
+    /// Size of the runtime thread pool.
     pub threads: Threads,
+    /// Maximum number of downloads running at the same time.
     pub max_concurrent: usize,
 }
 
@@ -46,14 +99,31 @@ impl Default for Settings {
     }
 }
 
+/// A single file to download: a source URL, a destination path, and an
+/// optional expected SHA-256 digest to verify against.
 #[derive(Clone, Debug)]
 pub struct Job {
+    /// Source URL.
     pub url: String,
+    /// Destination path on disk (parent directories are created as needed).
     pub dest: PathBuf,
+    /// Expected lowercase hex SHA-256, compared after download. `None` skips
+    /// the comparison but still computes the digest.
     pub expected_sha256: Option<String>,
 }
 
 impl Job {
+    /// Creates a job with no expected digest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_downloader::Job;
+    ///
+    /// let job = Job::new("https://example.com/a.bin", "/tmp/a.bin");
+    /// assert_eq!(job.url, "https://example.com/a.bin");
+    /// assert!(job.expected_sha256.is_none());
+    /// ```
     pub fn new(url: impl Into<String>, dest: impl Into<PathBuf>) -> Self {
         Self {
             url: url.into(),
@@ -62,51 +132,103 @@ impl Job {
         }
     }
 
+    /// Attaches an expected SHA-256 digest, enabling verification.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_downloader::Job;
+    ///
+    /// let job = Job::new("https://example.com/a.bin", "/tmp/a.bin")
+    ///     .with_sha256("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    /// assert!(job.expected_sha256.is_some());
+    /// ```
     pub fn with_sha256(mut self, sha256: impl Into<String>) -> Self {
         self.expected_sha256 = Some(sha256.into());
         self
     }
 }
 
+/// Result of comparing a finished file against its expected SHA-256.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verification {
+    /// No expected digest was provided.
     Skipped,
+    /// The computed digest matched the expected one.
     Ok,
+    /// The computed digest did not match the expected one.
     Mismatch,
 }
 
+/// Details of a successfully downloaded and hashed file.
 #[derive(Clone, Debug)]
 pub struct Outcome {
+    /// Path the file was written to.
     pub path: PathBuf,
+    /// Total bytes on disk.
     pub bytes: u64,
+    /// Computed lowercase hex SHA-256 of the file.
     pub sha256: String,
+    /// Outcome of the comparison against the expected digest.
     pub verified: Verification,
 }
 
+/// Live state of a single download, read by the UI every frame.
+///
+/// # Examples
+///
+/// ```
+/// use async_downloader::Progress;
+///
+/// let p = Progress::Downloading { received: 50, total: Some(100), speed: 1024.0 };
+/// assert_eq!(p.fraction(), Some(0.5));
+/// assert_eq!(p.speed(), 1024.0);
+/// assert!(!p.is_finished());
+/// ```
 #[derive(Clone, Debug)]
 pub enum Progress {
+    /// Waiting in the queue for a free worker.
     Queued,
+    /// Transfer in progress. `total` is `None` when the server sends no length.
     Downloading {
+        /// Bytes written to disk so far.
         received: u64,
+        /// Total size if known.
         total: Option<u64>,
+        /// Smoothed speed in bytes per second.
         speed: f64,
     },
-    Paused { received: u64, total: Option<u64> },
+    /// Paused by the user; the partial file is kept for resuming.
+    Paused {
+        /// Bytes already on disk.
+        received: u64,
+        /// Total size if known.
+        total: Option<u64>,
+    },
+    /// Download complete, computing the SHA-256 from disk.
     Verifying,
+    /// Finished successfully. See [`Outcome`].
     Done(Outcome),
+    /// Failed with this error message. The partial file is kept so the download
+    /// can be resumed.
     Failed(String),
+    /// Cancelled by the user; the partial file was removed.
     Cancelled,
 }
 
 impl Progress {
+    /// Whether the download reached a terminal, non-failure state
+    /// ([`Done`](Progress::Done) or [`Cancelled`](Progress::Cancelled)).
     pub fn is_finished(&self) -> bool {
         matches!(self, Progress::Done(_) | Progress::Cancelled)
     }
 
+    /// Whether work is actively happening (downloading or verifying).
     pub fn is_running(&self) -> bool {
         matches!(self, Progress::Downloading { .. } | Progress::Verifying)
     }
 
+    /// Bytes on disk for this download, or 0 when not applicable.
     pub fn received(&self) -> u64 {
         match self {
             Progress::Downloading { received, .. } | Progress::Paused { received, .. } => *received,
@@ -115,6 +237,7 @@ impl Progress {
         }
     }
 
+    /// Current speed in bytes per second, or 0 unless downloading.
     pub fn speed(&self) -> f64 {
         match self {
             Progress::Downloading { speed, .. } => *speed,
@@ -122,6 +245,7 @@ impl Progress {
         }
     }
 
+    /// Completion ratio in `0.0..=1.0`, or `None` when the total is unknown.
     pub fn fraction(&self) -> Option<f32> {
         match self {
             Progress::Downloading {
@@ -163,6 +287,25 @@ impl Shared {
     }
 }
 
+/// A cheap, clonable handle to one queued download.
+///
+/// Clones share the same underlying transfer, so you can keep one in your UI
+/// state and pass others around. Read [`progress`](Download::progress) to draw,
+/// and call [`pause`](Download::pause) / [`resume`](Download::resume) /
+/// [`cancel`](Download::cancel) to control it.
+///
+/// # Examples
+///
+/// ```no_run
+/// use async_downloader::{Downloader, Job, Settings};
+///
+/// let downloader = Downloader::new(Settings::default()).unwrap();
+/// let download = downloader.enqueue(Job::new("https://example.com/f", "/tmp/f"));
+///
+/// download.pause();
+/// download.resume();
+/// download.cancel();
+/// ```
 #[derive(Clone)]
 pub struct Download {
     shared: Arc<Shared>,
@@ -171,26 +314,37 @@ pub struct Download {
 }
 
 impl Download {
+    /// Unique id assigned when the job was enqueued. Stable across clones.
     pub fn id(&self) -> u64 {
         self.shared.id
     }
 
+    /// The [`Job`] this download was created from.
     pub fn job(&self) -> &Job {
         &self.shared.job
     }
 
+    /// Snapshot of the current [`Progress`]. Cheap; call it every frame.
     pub fn progress(&self) -> Progress {
         self.state.borrow().clone()
     }
 
+    /// A [`watch::Receiver`] that yields on every progress change.
+    ///
+    /// Used by the `iced` integration to drive a subscription; most UIs can
+    /// just poll [`progress`](Download::progress) instead.
     pub fn watch(&self) -> watch::Receiver<Progress> {
         self.state.clone()
     }
 
+    /// Requests a pause. The worker stops after the current chunk and keeps the
+    /// partial file. No effect on a finished download.
     pub fn pause(&self) {
         self.shared.command.store(CMD_PAUSE, Ordering::SeqCst);
     }
 
+    /// Re-queues a paused or failed download, resuming from the bytes already on
+    /// disk via an HTTP `Range` request. No effect in any other state.
     pub fn resume(&self) {
         if matches!(self.progress(), Progress::Paused { .. } | Progress::Failed(_)) {
             self.shared.command.store(CMD_RUN, Ordering::SeqCst);
@@ -199,6 +353,7 @@ impl Download {
         }
     }
 
+    /// Cancels the download and removes the partial file.
     pub fn cancel(&self) {
         self.shared.command.store(CMD_CANCEL, Ordering::SeqCst);
         if !self.shared.running.load(Ordering::SeqCst) && !self.progress().is_finished() {
@@ -207,30 +362,63 @@ impl Download {
     }
 }
 
+/// Aggregated progress over a [`Batch`] of downloads.
+///
+/// # Examples
+///
+/// ```
+/// use async_downloader::BatchProgress;
+///
+/// let p = BatchProgress {
+///     files: 4,
+///     done: 2,
+///     failed: 0,
+///     cancelled: 0,
+///     bytes_received: 30,
+///     bytes_total: Some(100),
+///     speed: 2048.0,
+/// };
+/// assert_eq!(p.settled(), 2);
+/// assert_eq!(p.fraction(), Some(0.3));
+/// assert!(!p.all_done());
+/// ```
+
 #[derive(Clone, Debug)]
 pub struct BatchProgress {
+    /// Total number of files in the batch.
     pub files: usize,
+    /// Files finished and verified.
     pub done: usize,
+    /// Files that failed.
     pub failed: usize,
+    /// Files that were cancelled.
     pub cancelled: usize,
+    /// Sum of bytes received across all files.
     pub bytes_received: u64,
+    /// Sum of total sizes, or `None` if any unfinished file's size is unknown.
     pub bytes_total: Option<u64>,
+    /// Combined speed of the files currently downloading, in bytes per second.
     pub speed: f64,
 }
 
 impl BatchProgress {
+    /// Number of files in a terminal state (done + failed + cancelled).
     pub fn settled(&self) -> usize {
         self.done + self.failed + self.cancelled
     }
 
+    /// Whether every file has settled (in any terminal state).
     pub fn is_complete(&self) -> bool {
         self.files > 0 && self.settled() == self.files
     }
 
+    /// Whether every file finished successfully.
     pub fn all_done(&self) -> bool {
         self.files > 0 && self.done == self.files
     }
 
+    /// Overall ratio in `0.0..=1.0`. Uses bytes when all totals are known,
+    /// otherwise falls back to the settled-files ratio; `None` when empty.
     pub fn fraction(&self) -> Option<f32> {
         match self.bytes_total {
             Some(total) if total > 0 => Some((self.bytes_received as f32 / total as f32).min(1.0)),
@@ -240,36 +428,66 @@ impl BatchProgress {
     }
 }
 
+/// A group of downloads handled as one unit, e.g. a launcher pack.
+///
+/// Returned by [`Downloader::enqueue_batch`]. Read [`progress`](Batch::progress)
+/// for an aggregate view, iterate [`downloads`](Batch::downloads) for per-file
+/// state, and use the `*_all` methods for group control.
+///
+/// # Examples
+///
+/// ```no_run
+/// use async_downloader::{Downloader, Job, Settings};
+///
+/// let downloader = Downloader::new(Settings::default()).unwrap();
+/// let batch = downloader.enqueue_batch(vec![
+///     Job::new("https://example.com/a.pak", "/data/a.pak"),
+///     Job::new("https://example.com/b.pak", "/data/b.pak"),
+/// ]);
+///
+/// let p = batch.progress();
+/// println!("{}/{} files", p.done, p.files);
+/// batch.pause_all();
+/// ```
 #[derive(Clone)]
 pub struct Batch {
     downloads: Vec<Download>,
 }
 
 impl Batch {
+    /// Wraps an existing set of [`Download`] handles, e.g. to aggregate
+    /// downloads you enqueued individually.
     pub fn new(downloads: Vec<Download>) -> Self {
         Self { downloads }
     }
 
+    /// The individual downloads, for per-file progress and controls.
     pub fn downloads(&self) -> &[Download] {
         &self.downloads
     }
 
+    /// Whether every file in the batch has settled.
     pub fn is_finished(&self) -> bool {
         self.progress().is_complete()
     }
 
+    /// Pauses every file in the batch.
     pub fn pause_all(&self) {
         self.downloads.iter().for_each(Download::pause);
     }
 
+    /// Resumes every paused or failed file in the batch.
     pub fn resume_all(&self) {
         self.downloads.iter().for_each(Download::resume);
     }
 
+    /// Cancels every file in the batch.
     pub fn cancel_all(&self) {
         self.downloads.iter().for_each(Download::cancel);
     }
 
+    /// Recomputes the aggregate [`BatchProgress`] from each file's current
+    /// state. Cheap; call it every frame.
     pub fn progress(&self) -> BatchProgress {
         let mut acc = BatchProgress {
             files: self.downloads.len(),
@@ -327,6 +545,26 @@ fn accumulate_total(acc: &mut Option<u64>, total: Option<u64>) {
     }
 }
 
+/// Owns the Tokio runtime and the prespawned worker pool, and hands out
+/// [`Download`] / [`Batch`] handles.
+///
+/// Keep it alive for as long as its downloads run: dropping it shuts the
+/// runtime down and aborts in-flight transfers.
+///
+/// # Examples
+///
+/// ```no_run
+/// use async_downloader::{Downloader, Job, Settings, Threads};
+///
+/// let downloader = Downloader::new(Settings {
+///     threads: Threads::Auto,
+///     max_concurrent: 3,
+/// })
+/// .expect("runtime");
+///
+/// let download = downloader.enqueue(Job::new("https://example.com/f", "/tmp/f"));
+/// let _ = download.progress();
+/// ```
 pub struct Downloader {
     rt: tokio::runtime::Runtime,
     queue: async_channel::Sender<Arc<Shared>>,
@@ -337,6 +575,9 @@ pub struct Downloader {
 }
 
 impl Downloader {
+    /// Builds the runtime and immediately spawns `max_concurrent` worker tasks.
+    ///
+    /// Returns an error only if the Tokio runtime fails to start.
     pub fn new(settings: Settings) -> std::io::Result<Self> {
         let worker_threads = settings.threads.resolve();
         let max_concurrent = settings.max_concurrent.max(1);
@@ -365,19 +606,47 @@ impl Downloader {
         })
     }
 
+    /// Sets a callback fired on every progress change, on a worker thread.
+    ///
+    /// Use it to wake the UI; with `egui` this is
+    /// [`egui_view::repaint_notifier`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use async_downloader::{Downloader, Settings};
+    ///
+    /// let downloader = Downloader::new(Settings::default())
+    ///     .unwrap()
+    ///     .on_change(|| println!("progress changed"));
+    /// ```
     pub fn on_change(mut self, callback: impl Fn() + Send + Sync + 'static) -> Self {
         self.on_change = Arc::new(callback);
         self
     }
 
+    /// Number of runtime worker threads (the resolved [`Threads`] value).
     pub fn worker_threads(&self) -> usize {
         self.worker_threads
     }
 
+    /// Maximum number of downloads running at once (the size of the worker pool).
     pub fn max_concurrent(&self) -> usize {
         self.max_concurrent
     }
 
+    /// Queues a single [`Job`] and returns its [`Download`] handle.
+    ///
+    /// Returns immediately; the transfer starts as soon as a worker is free.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use async_downloader::{Downloader, Job, Settings};
+    ///
+    /// let downloader = Downloader::new(Settings::default()).unwrap();
+    /// let download = downloader.enqueue(Job::new("https://example.com/f", "/tmp/f"));
+    /// ```
     pub fn enqueue(&self, job: Job) -> Download {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (state_tx, state_rx) = watch::channel(Progress::Queued);
@@ -398,6 +667,21 @@ impl Downloader {
         }
     }
 
+    /// Queues many jobs as one [`Batch`] with aggregate progress and group
+    /// controls.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use async_downloader::{Downloader, Job, Settings};
+    ///
+    /// let downloader = Downloader::new(Settings::default()).unwrap();
+    /// let batch = downloader.enqueue_batch(vec![
+    ///     Job::new("https://example.com/a", "/tmp/a"),
+    ///     Job::new("https://example.com/b", "/tmp/b"),
+    /// ]);
+    /// assert_eq!(batch.downloads().len(), 2);
+    /// ```
     pub fn enqueue_batch(&self, jobs: impl IntoIterator<Item = Job>) -> Batch {
         Batch::new(jobs.into_iter().map(|job| self.enqueue(job)).collect())
     }
@@ -646,6 +930,15 @@ async fn sha256_of_file(path: &Path) -> Result<String, String> {
     Ok(hex)
 }
 
+/// Formats a byte count with a binary unit (`B`, `KiB`, `MiB`, ...).
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(async_downloader::human_bytes(512), "512 B");
+/// assert_eq!(async_downloader::human_bytes(1024), "1.0 KiB");
+/// assert_eq!(async_downloader::human_bytes(5 * 1024 * 1024), "5.0 MiB");
+/// ```
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -661,6 +954,14 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Formats a speed as `"<size>/s"`, or `"—"` when zero or negative.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(async_downloader::human_speed(0.0), "—");
+/// assert_eq!(async_downloader::human_speed(2048.0), "2.0 KiB/s");
+/// ```
 pub fn human_speed(bytes_per_second: f64) -> String {
     if bytes_per_second <= 0.0 {
         return "—".to_owned();
@@ -668,6 +969,18 @@ pub fn human_speed(bytes_per_second: f64) -> String {
     format!("{}/s", human_bytes(bytes_per_second as u64))
 }
 
+/// Extracts a file name from a URL, ignoring any query or fragment.
+///
+/// Returns `None` when there is no usable last path segment.
+///
+/// # Examples
+///
+/// ```
+/// use async_downloader::file_name_from_url;
+///
+/// assert_eq!(file_name_from_url("https://host/dir/file.bin?v=1").as_deref(), Some("file.bin"));
+/// assert_eq!(file_name_from_url(""), None);
+/// ```
 pub fn file_name_from_url(url: &str) -> Option<String> {
     let trimmed = url.split(['?', '#']).next().unwrap_or(url);
     let name = trimmed.trim_end_matches('/').rsplit('/').next()?;
